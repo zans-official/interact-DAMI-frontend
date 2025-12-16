@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DAMI - Voice Assistant</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f0f1e;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #fff;
+            overflow-x: hidden;
+        }
+
+        .background-gradient {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 50% 50%, rgba(99, 102, 241, 0.15) 0%, rgba(15, 15, 30, 0) 50%);
+            z-index: 0;
+            pointer-events: none;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 480px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 32px;
+        }
+
+        /* Branding */
+        .brand {
+            text-align: center;
+            animation: fadeInDown 0.8s ease-out;
+        }
+
+        .brand h1 {
+            font-size: clamp(2.5rem, 8vw, 4rem);
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+            margin-bottom: 8px;
+        }
+
+        .brand p {
+            color: #94a3b8;
+            font-size: clamp(0.9rem, 2.5vw, 1.1rem);
+            font-weight: 400;
+        }
+
+        /* Voice Visualizer */
+        .voice-visualizer {
+            position: relative;
+            width: 100%;
+            max-width: 300px;
+            aspect-ratio: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 1s ease-out 0.3s both;
+        }
+
+        .orb-container {
+            position: relative;
+            width: 180px;
+            height: 180px;
+        }
+
+        .orb {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+            box-shadow: 0 0 60px rgba(99, 102, 241, 0.4);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .orb-ring {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            border: 2px solid rgba(99, 102, 241, 0.3);
+            animation: none;
+        }
+
+        .orb.listening {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            box-shadow: 0 0 80px rgba(16, 185, 129, 0.6);
+            animation: breathe 2s ease-in-out infinite;
+        }
+
+        .orb.listening .orb-ring:nth-child(1) {
+            animation: ripple 2s ease-out infinite;
+        }
+
+        .orb.listening .orb-ring:nth-child(2) {
+            animation: ripple 2s ease-out infinite 0.5s;
+        }
+
+        .orb.listening .orb-ring:nth-child(3) {
+            animation: ripple 2s ease-out infinite 1s;
+        }
+
+        .orb.speaking {
+            background: linear-gradient(135deg, #8b5cf6 0%, #ec4899 100%);
+            box-shadow: 0 0 100px rgba(139, 92, 246, 0.8);
+            animation: pulse-speaking 0.6s ease-in-out infinite;
+        }
+
+        /* Wave bars for speaking */
+        .wave-container {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .orb.listening .wave-container {
+            opacity: 1;
+        }
+
+        .wave-bar {
+            width: 4px;
+            height: 20px;
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 2px;
+            animation: wave 1s ease-in-out infinite;
+        }
+
+        .wave-bar:nth-child(1) { animation-delay: 0s; }
+        .wave-bar:nth-child(2) { animation-delay: 0.1s; }
+        .wave-bar:nth-child(3) { animation-delay: 0.2s; }
+        .wave-bar:nth-child(4) { animation-delay: 0.3s; }
+        .wave-bar:nth-child(5) { animation-delay: 0.2s; }
+        .wave-bar:nth-child(6) { animation-delay: 0.1s; }
+
+        /* Status Text */
+        .status-text {
+            text-align: center;
+            margin-top: -20px;
+            font-size: clamp(1rem, 3vw, 1.25rem);
+            font-weight: 500;
+            color: #94a3b8;
+            min-height: 30px;
+            animation: fadeIn 1s ease-out 0.5s both;
+        }
+
+        .status-text.active {
+            color: #10b981;
+        }
+
+        .status-text.speaking {
+            color: #a855f7;
+        }
+
+        /* Input Section */
+        .input-section {
+            width: 100%;
+            animation: fadeInUp 1s ease-out 0.6s both;
+        }
+
+        .input-group {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .input-group:focus-within {
+            border-color: rgba(99, 102, 241, 0.5);
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
+        }
+
+        .input-group label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: #94a3b8;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .input-group input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            font-size: 1rem;
+            color: #fff;
+            font-family: inherit;
+            transition: all 0.3s ease;
+        }
+
+        .input-group input:focus {
+            outline: none;
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(99, 102, 241, 0.5);
+        }
+
+        .input-group input::placeholder {
+            color: #64748b;
+        }
+
+        /* Buttons */
+        .button-group {
+            display: flex;
+            gap: 12px;
+            width: 100%;
+            animation: fadeInUp 1s ease-out 0.7s both;
+        }
+
+        button {
+            flex: 1;
+            padding: 16px 24px;
+            border: none;
+            border-radius: 16px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-family: inherit;
+            position: relative;
+            overflow: hidden;
+        }
+
+        button::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+
+        button:active::before {
+            width: 300px;
+            height: 300px;
+        }
+
+        #toggleButton {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: white;
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+        }
+
+        #toggleButton:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(99, 102, 241, 0.5);
+        }
+
+        #toggleButton.active {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
+        }
+
+        #downloadButton {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: none;
+        }
+
+        #downloadButton:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.15);
+            transform: translateY(-2px);
+        }
+
+        #downloadButton:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        /* Debug Panel (Collapsible) */
+        .debug-panel {
+            width: 100%;
+            margin-top: 20px;
+            animation: fadeInUp 1s ease-out 0.8s both;
+        }
+
+        .debug-toggle {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            color: #94a3b8;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: all 0.3s ease;
+        }
+
+        .debug-toggle:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .debug-toggle .icon {
+            transition: transform 0.3s ease;
+        }
+
+        .debug-toggle.open .icon {
+            transform: rotate(180deg);
+        }
+
+        .debug-content {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease;
+        }
+
+        .debug-content.open {
+            max-height: 400px;
+        }
+
+        .message-log {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .message-log p {
+            padding: 8px 12px;
+            margin: 4px 0;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            font-size: 0.75rem;
+            color: #94a3b8;
+            font-family: 'Courier New', monospace;
+            border-left: 2px solid rgba(99, 102, 241, 0.5);
+        }
+
+        .message-log .placeholder {
+            color: #64748b;
+            font-style: italic;
+            border-left: none;
+        }
+
+        .message-log::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .message-log::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+        }
+
+        .message-log::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes breathe {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.08); }
+        }
+
+        @keyframes pulse-speaking {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.12); }
+        }
+
+        @keyframes ripple {
+            0% {
+                transform: scale(1);
+                opacity: 0.6;
+            }
+            100% {
+                transform: scale(1.8);
+                opacity: 0;
+            }
+        }
+
+        @keyframes wave {
+            0%, 100% { height: 20px; }
+            50% { height: 40px; }
+        }
+
+        /* Mobile Optimizations */
+        @media (max-width: 640px) {
+            body {
+                padding: 16px;
+            }
+
+            .container {
+                gap: 24px;
+            }
+
+            .orb-container {
+                width: 150px;
+                height: 150px;
+            }
+
+            .brand h1 {
+                font-size: 3rem;
+            }
+
+            button {
+                padding: 14px 20px;
+                font-size: 0.9rem;
+            }
+
+            .input-group {
+                padding: 16px;
+            }
+        }
+
+        @media (max-width: 380px) {
+            .button-group {
+                flex-direction: column;
+            }
+        }
+
+        /* Landscape Mobile */
+        @media (max-height: 600px) and (orientation: landscape) {
+            .container {
+                gap: 16px;
+                padding: 10px 0;
+            }
+
+            .orb-container {
+                width: 120px;
+                height: 120px;
+            }
+
+            .brand {
+                margin-bottom: -10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="background-gradient"></div>
+    
+    <div class="container">
+        <!-- Branding -->
+        <div class="brand">
+            <h1>DAMI</h1>
+            <p>Your Voice Companion</p>
+        </div>
+
+        <!-- Voice Visualizer -->
+        <div class="voice-visualizer">
+            <div class="orb-container">
+                <div id="vadIndicator" class="orb">
+                    <div class="orb-ring"></div>
+                    <div class="orb-ring"></div>
+                    <div class="orb-ring"></div>
+                    <div class="wave-container">
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status -->
+        <div id="status" class="status-text">Speak to DAMI</div>
+
+        <!-- Input -->
+        <div class="input-section">
+            <div class="input-group">
+                <label for="toyIdInput">Device ID</label>
+                <input type="text" id="toyIdInput" placeholder="Enter your device ID">
+            </div>
+        </div>
+
+        <!-- Buttons -->
+        <div class="button-group">
+            <button id="toggleButton" class="inactive">Start Conversation</button>
+            <button id="downloadButton" disabled>Download</button>
+        </div>
+
+        <!-- Debug Panel -->
+        <div class="debug-panel">
+            <button class="debug-toggle" id="debugToggle">
+                <span>Debug Logs</span>
+                <span class="icon">▼</span>
+            </button>
+            <div class="debug-content" id="debugContent">
+                <div class="message-log">
+                    <div id="controlMessages">
+                        <p class="placeholder">No messages yet.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="client.js"></script>
+</body>
+</html>
