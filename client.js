@@ -15,9 +15,9 @@ if (debugToggle) {
     });
 }
 
-const SERVER_URL = 'ws://esp-backend-eng-612228147959.asia-south1.run.app';
-// const SERVER_URL = 'ws://127.0.0.1:8000/';
-// const SERVER_URL = 'ws://esp-backend-multilingual-612228147959.asia-south1.run.app';
+const SERVER_URL = 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
+// const SERVER_URL = 'ws://127.0.0.1:8000/';  // Use ws:// for local development
+// const SERVER_URL = 'wss://esp-backend-multilingual-612228147959.asia-south1.run.app';
 
 // Frame size limits for WebSocket
 const OUTGOING_MAX_FRAME_SIZE = 1024;
