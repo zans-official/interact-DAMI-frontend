@@ -1,5 +1,6 @@
 const toggleButton = document.getElementById('toggleButton');
 const downloadButton = document.getElementById('downloadButton');
+const downloadMicButton = document.getElementById('downloadMicButton');
 const statusDiv = document.getElementById('status');
 const messagesDiv = document.getElementById('controlMessages');
 const vadIndicator = document.getElementById('vadIndicator');
@@ -25,6 +26,9 @@ const INCOMING_MAX_FRAME_SIZE = 2048;
 const STANDARD_DELAY_MS = 100;
 const CONTROL_READY_MESSAGE = 'Ready to listen';
 const CONTROL_AUDIO_READY_MESSAGE = 'Audio Ready';
+const MAX_SPEECH_DURATION_MS = 8000;
+const PRE_EMPHASIS_COEFF = 0.90;
+const SILENCE_GRACE_MS = 2500;
 // ================= VAD / ENERGY CONFIG =================
 
 // Physics thresholds
@@ -39,6 +43,14 @@ const SPEECH_END_FRAMES   = 10;  // ~200 ms
 let speechFrames  = 0;
 let silenceFrames = 0;
 let inSpeech      = false;
+let speechStartTimestamp = 0;
+let micLocked = false;
+let awaitingAudioReady = false;
+let awaitingPlaybackCompletion = false;
+let serverReadyPending = false;
+let activePlaybackSources = 0;
+let lastPreEmphasisSample = 0;
+let silenceDurationMs = 0;
 
 
 let websocket;
@@ -47,6 +59,7 @@ let scriptProcessor;
 let mediaStream;
 let isListeningEnabled = false;
 let readyTimer = null;
+let frameDurationMs = 0;
 
 // Playback buffers
 let playbackContext;
@@ -55,6 +68,8 @@ let nextPlaybackTime = 0;
 // Recording buffers
 let recordingChunks = [];
 let isRecording = true; // always record incoming for now
+let micRecordingChunks = [];
+let isMicRecording = true;
 
 toggleButton.addEventListener('click', () => {
     if (toggleButton.classList.contains('inactive')) {
@@ -68,6 +83,12 @@ downloadButton.addEventListener('click', () => {
     downloadRecording();
 });
 
+if (downloadMicButton) {
+    downloadMicButton.addEventListener('click', () => {
+        downloadMicRecording();
+    });
+}
+
 // ================= MAIN STREAMING ================= //
 
 function startStreaming() {
@@ -78,6 +99,14 @@ function startStreaming() {
     statusDiv.textContent = 'Connecting to DAMI...';
     statusDiv.className = 'status-text';
     isListeningEnabled = false;
+    micLocked = false;
+    awaitingAudioReady = false;
+    awaitingPlaybackCompletion = false;
+    serverReadyPending = false;
+    activePlaybackSources = 0;
+    micRecordingChunks = [];
+    if (downloadMicButton) downloadMicButton.disabled = true;
+    resetVadState();
     if (readyTimer) {
         clearTimeout(readyTimer);
         readyTimer = null;
@@ -185,10 +214,86 @@ function stopStreamingCleanup() {
     // Reset VAD visual state
     vadIndicator.classList.remove('listening', 'speaking');
     
-    // Reset VAD state machine
+    resetVadState();
+    micLocked = false;
+    awaitingAudioReady = false;
+    awaitingPlaybackCompletion = false;
+    serverReadyPending = false;
+    activePlaybackSources = 0;
+}
+
+function resetVadState() {
     speechFrames = 0;
     silenceFrames = 0;
     inSpeech = false;
+    lastPreEmphasisSample = 0;
+    silenceDurationMs = 0;
+}
+
+function lockMicInput() {
+    micLocked = true;
+    isListeningEnabled = false;
+    resetVadState();
+    vadIndicator.classList.remove('listening');
+}
+
+function maybeEnableMicListening(options = {}) {
+    const { force = false } = options;
+    if (!force && !serverReadyPending) return;
+    if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+        serverReadyPending = false;
+        return;
+    }
+    if (!force && (awaitingAudioReady || awaitingPlaybackCompletion)) return;
+
+    if (readyTimer) {
+        clearTimeout(readyTimer);
+        readyTimer = null;
+    }
+    
+    micLocked = false;
+    isListeningEnabled = true;
+    serverReadyPending = false;
+    awaitingAudioReady = false;
+    awaitingPlaybackCompletion = false;
+    statusDiv.textContent = 'Listening to you...';
+    statusDiv.className = 'status-text active';
+    vadIndicator.classList.remove('speaking');
+}
+
+function endUserSpeech(reason = 'silence') {
+    if (!inSpeech) return;
+
+    inSpeech = false;
+    speechFrames = 0;
+    silenceFrames = 0;
+    silenceDurationMs = 0;
+    vadIndicator.classList.remove('listening');
+    statusDiv.textContent = 'Processing...';
+    statusDiv.className = 'status-text';
+    appendControlMessage(reason === 'max_duration' ? 'Speech max duration reached' : 'Speech ended');
+
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.send(JSON.stringify({ type: "TURN_END", reason }));
+    }
+    lockMicInput();
+    awaitingAudioReady = true;
+    awaitingPlaybackCompletion = false;
+    serverReadyPending = false;
+}
+
+function applyPreEmphasis(input, coeff = PRE_EMPHASIS_COEFF) {
+    const filtered = new Float32Array(input.length);
+    let previous = lastPreEmphasisSample;
+
+    for (let i = 0; i < input.length; i++) {
+        const current = input[i];
+        filtered[i] = current - coeff * previous;
+        previous = current;
+    }
+
+    lastPreEmphasisSample = previous;
+    return filtered;
 }
 
 // ================= CONTROL MESSAGE HANDLING ================= //
@@ -218,17 +323,15 @@ function handleControlMessage(rawMessage) {
     const normalized = message.toLowerCase();
 
     if (normalized === CONTROL_READY_MESSAGE.toLowerCase()) {
-        isListeningEnabled = false;
         statusDiv.textContent = 'Ready...';
         statusDiv.className = 'status-text';
+        serverReadyPending = true;
         if (readyTimer) {
             clearTimeout(readyTimer);
         }
         readyTimer = setTimeout(() => {
-            isListeningEnabled = true;
             readyTimer = null;
-            statusDiv.textContent = 'Listening to you...';
-            statusDiv.className = 'status-text active';
+            maybeEnableMicListening();
         }, STANDARD_DELAY_MS);
         return;
     }
@@ -238,11 +341,24 @@ function handleControlMessage(rawMessage) {
             clearTimeout(readyTimer);
             readyTimer = null;
         }
-        isListeningEnabled = false;
+        lockMicInput();
+        awaitingAudioReady = false;
+        awaitingPlaybackCompletion = false;
+        serverReadyPending = false;
         statusDiv.textContent = 'DAMI is speaking...';
         statusDiv.className = 'status-text speaking';
         vadIndicator.classList.add('speaking');
         vadIndicator.classList.remove('listening');
+        
+        // Fallback: if no audio arrives within 3s, re-enable mic
+        if (readyTimer) clearTimeout(readyTimer);
+        readyTimer = setTimeout(() => {
+            readyTimer = null;
+            if (activePlaybackSources === 0 && !inSpeech) {
+                appendControlMessage('No audio received, resuming listening');
+                maybeEnableMicListening({ force: true });
+            }
+        }, 3000);
         return;
     }
 
@@ -259,36 +375,50 @@ async function startMicrophone() {
 
         const source = audioContext.createMediaStreamSource(mediaStream);
         scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        frameDurationMs = (scriptProcessor.bufferSize / audioContext.sampleRate) * 1000;
 
         scriptProcessor.onaudioprocess = (event) => {
             const input = event.inputBuffer.getChannelData(0);
+
+            if (micLocked || !isListeningEnabled) {
+                resetVadState();
+                return;
+            }
+
+            const emphasized = applyPreEmphasis(input);
 
             // ---------- ENERGY CALCULATION ----------
             let sumSquares = 0;
             let peak = 0;
 
-            for (let i = 0; i < input.length; i++) {
-                const v = input[i];
+            for (let i = 0; i < emphasized.length; i++) {
+                const v = emphasized[i];
                 sumSquares += v * v;
                 peak = Math.max(peak, Math.abs(v));
             }
 
-            const rms = Math.sqrt(sumSquares / input.length);
+            const rms = Math.sqrt(sumSquares / emphasized.length);
             const isSpeech = rms > ENERGY_THRESHOLD || peak > PEAK_THRESHOLD;
 
             // ---------- VAD STATE MACHINE ----------
             if (isSpeech) {
                 speechFrames++;
                 silenceFrames = 0;
+                silenceDurationMs = 0;
             } else {
                 silenceFrames++;
                 speechFrames = 0;
+                silenceDurationMs += frameDurationMs;
             }
 
             // ---------- SPEECH START ----------
             if (!inSpeech && speechFrames >= SPEECH_START_FRAMES) {
                 inSpeech = true;
                 speechFrames = 0;
+                speechStartTimestamp = performance.now();
+                awaitingAudioReady = false;
+                awaitingPlaybackCompletion = false;
+                serverReadyPending = false;
 
                 vadIndicator.classList.add('listening');
                 vadIndicator.classList.remove('speaking');
@@ -297,29 +427,34 @@ async function startMicrophone() {
                 appendControlMessage('Speech detected');
 
                 websocket?.send(JSON.stringify({ type: "TURN_START" }));
-                isListeningEnabled = true;
+            }
+
+            // ---------- MAX DURATION SAFEGUARD ----------
+            if (inSpeech) {
+                const elapsed = performance.now() - speechStartTimestamp;
+                if (elapsed >= MAX_SPEECH_DURATION_MS) {
+                    endUserSpeech('max_duration');
+                    return;
+                }
             }
 
             // ---------- SPEECH END ----------
-            if (inSpeech && silenceFrames >= SPEECH_END_FRAMES) {
-                inSpeech = false;
-                silenceFrames = 0;
-
-                vadIndicator.classList.remove('listening');
-                vadIndicator.classList.remove('speaking');
-                statusDiv.textContent = 'Processing...';
-                statusDiv.className = 'status-text';
-                appendControlMessage('Speech ended');
-
-                websocket?.send(JSON.stringify({ type: "TURN_END" }));
-                isListeningEnabled = false;
+            if (inSpeech && silenceDurationMs >= SILENCE_GRACE_MS) {
+                endUserSpeech('silence');
                 return;
             }
 
             // ---------- SEND AUDIO ONLY IF SPEAKING ----------
             if (inSpeech && websocket.readyState === WebSocket.OPEN) {
-                const resampled = resampleTo16k(input, audioContext.sampleRate);
+                const resampled = resampleTo16k(emphasized, audioContext.sampleRate);
                 const pcm16 = toPCM16(resampled);
+                
+                // Record user mic input for debugging
+                if (isMicRecording) {
+                    micRecordingChunks.push(pcm16.slice(0));
+                    if (downloadMicButton) downloadMicButton.disabled = false;
+                }
+                
                 sendAudioInChunks(pcm16);
             }
         };
@@ -366,6 +501,20 @@ function playAudioFrameStreaming(frameData) {
         const source = playbackContext.createBufferSource();
         source.buffer = buffer;
         source.connect(playbackContext.destination);
+        awaitingPlaybackCompletion = true;
+        activePlaybackSources++;
+        source.onended = () => {
+            activePlaybackSources = Math.max(0, activePlaybackSources - 1);
+            if (activePlaybackSources === 0) {
+                awaitingPlaybackCompletion = false;
+                vadIndicator.classList.remove('speaking');
+                if (readyTimer) {
+                    clearTimeout(readyTimer);
+                    readyTimer = null;
+                }
+                maybeEnableMicListening({ force: true });
+            }
+        };
         
         // Schedule playback to maintain continuous audio stream
         const currentTime = playbackContext.currentTime;
@@ -396,6 +545,25 @@ function downloadRecording() {
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     link.download = "assistant-recording.wav";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(link.href);
+}
+
+function downloadMicRecording() {
+    if (!micRecordingChunks.length) {
+        alert('No mic audio recorded yet!');
+        return;
+    }
+
+    const wav = encodeWAV(micRecordingChunks, 16000);
+    const blob = new Blob([wav], { type: 'audio/wav' });
+
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = "my-mic-input.wav";
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
