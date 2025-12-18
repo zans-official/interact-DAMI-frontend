@@ -16,8 +16,8 @@ if (debugToggle) {
     });
 }
 
-const SERVER_URL = 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
-// const SERVER_URL = 'ws://127.0.0.1:8000/';  // Use ws:// for local development
+// const SERVER_URL = 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
+const SERVER_URL = 'ws://127.0.0.1:8000/';  // Use ws:// for local development
 // const SERVER_URL = 'wss://esp-backend-multilingual-612228147959.asia-south1.run.app';
 
 // Frame size limits for WebSocket
@@ -28,22 +28,41 @@ const CONTROL_READY_MESSAGE = 'Ready to listen';
 const CONTROL_AUDIO_READY_MESSAGE = 'Audio Ready';
 const MAX_SPEECH_DURATION_MS = 8000;
 const PRE_EMPHASIS_COEFF = 0.90;
-const SILENCE_GRACE_MS = 2500;
-// ================= VAD / ENERGY CONFIG =================
+const SILENCE_GRACE_MS = 1500;  // Reduced from 2500ms for faster response
 
-// Physics thresholds
-const ENERGY_THRESHOLD = 0.02;   // RMS loudness
-const PEAK_THRESHOLD   = 0.05;   // Peak amplitude
+// ================= PROFESSIONAL VAD SYSTEM =================
 
-// Hangover logic
-const SPEECH_START_FRAMES = 3;   // ~60 ms
-const SPEECH_END_FRAMES   = 10;  // ~200 ms
+// Calibration and adaptation
+const CALIBRATION_FRAMES = 30;           // ~600ms initial calibration
+const ADAPTATION_ALPHA = 0.95;           // Smoothing for adaptive thresholds
+const MIN_SPEECH_DURATION_MS = 300;      // Minimum speech to be considered valid
+const SPEECH_START_FRAMES = 2;           // Reduced to 2 frames (~40ms) for faster response
+const SPEECH_END_FRAMES = 25;            // ~500ms hangover after speech ends
+
+// Multi-feature thresholds (will be adapted)
+let energyThreshold = 0.01;              // Dynamic RMS threshold
+let peakThreshold = 0.03;                // Dynamic peak threshold  
+let zcrThreshold = 0.3;                  // Zero-crossing rate threshold
+let spectralThreshold = 1000;            // Spectral centroid threshold
+
+// Noise floor estimation
+let noiseFloorRMS = 0.001;               // Estimated background noise
+let noiseFloorPeak = 0.005;
+let noiseSamples = [];
+let calibrationFrameCount = 0;
+let isCalibrated = false;
+
+// Running statistics for adaptation
+let recentEnergyLevels = [];
+let recentPeakLevels = [];
+const HISTORY_SIZE = 100;                // Keep last 100 frames for adaptation
 
 // VAD runtime state
 let speechFrames  = 0;
 let silenceFrames = 0;
 let inSpeech      = false;
 let speechStartTimestamp = 0;
+let speechDuration = 0;
 let micLocked = false;
 let awaitingAudioReady = false;
 let awaitingPlaybackCompletion = false;
@@ -70,6 +89,8 @@ let recordingChunks = [];
 let isRecording = true; // always record incoming for now
 let micRecordingChunks = [];
 let isMicRecording = true;
+let lastControlMessage = null;
+let lastControlMessageTime = 0;
 
 toggleButton.addEventListener('click', () => {
     if (toggleButton.classList.contains('inactive')) {
@@ -107,6 +128,7 @@ function startStreaming() {
     micRecordingChunks = [];
     if (downloadMicButton) downloadMicButton.disabled = true;
     resetVadState();
+    resetVadCalibration();
     if (readyTimer) {
         clearTimeout(readyTimer);
         readyTimer = null;
@@ -129,8 +151,8 @@ function startStreaming() {
     websocket.binaryType = 'arraybuffer';
 
     websocket.onopen = () => {
-        console.log('WebSocket connected.');
-        statusDiv.textContent = 'Connected. Initializing...';
+        console.log('\u2713 WebSocket connected.');
+        statusDiv.textContent = 'Initializing microphone...';
         statusDiv.className = 'status-text';
         appendControlMessage('Connected to server. Awaiting ready signal...');
         startMicrophone();
@@ -228,9 +250,25 @@ function resetVadState() {
     inSpeech = false;
     lastPreEmphasisSample = 0;
     silenceDurationMs = 0;
+    speechDuration = 0;
+    // Don't reset calibration data
+}
+
+function resetVadCalibration() {
+    calibrationFrameCount = 0;
+    isCalibrated = false;
+    noiseSamples = [];
+    recentEnergyLevels = [];
+    recentPeakLevels = [];
+    noiseFloorRMS = 0.001;
+    noiseFloorPeak = 0.005;
+    energyThreshold = 0.01;
+    peakThreshold = 0.03;
+    console.log('🔄 VAD calibration reset');
 }
 
 function lockMicInput() {
+    console.log('🔒 Locking microphone input');
     micLocked = true;
     isListeningEnabled = false;
     resetVadState();
@@ -239,18 +277,37 @@ function lockMicInput() {
 
 function maybeEnableMicListening(options = {}) {
     const { force = false } = options;
-    if (!force && !serverReadyPending) return;
+    
+    console.log('maybeEnableMicListening called:', {
+        force,
+        serverReadyPending,
+        awaitingAudioReady,
+        awaitingPlaybackCompletion,
+        activePlaybackSources,
+        micLocked,
+        isListeningEnabled
+    });
+    
+    if (!force && !serverReadyPending) {
+        console.log('Skipping: not forced and no serverReadyPending');
+        return;
+    }
     if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+        console.log('Skipping: websocket not open');
         serverReadyPending = false;
         return;
     }
-    if (!force && (awaitingAudioReady || awaitingPlaybackCompletion)) return;
+    if (!force && (awaitingAudioReady || awaitingPlaybackCompletion || activePlaybackSources > 0)) {
+        console.log('Skipping: waiting for audio/playback completion');
+        return;
+    }
 
     if (readyTimer) {
         clearTimeout(readyTimer);
         readyTimer = null;
     }
     
+    console.log('✓ Enabling microphone listening');
     micLocked = false;
     isListeningEnabled = true;
     serverReadyPending = false;
@@ -259,22 +316,41 @@ function maybeEnableMicListening(options = {}) {
     statusDiv.textContent = 'Listening to you...';
     statusDiv.className = 'status-text active';
     vadIndicator.classList.remove('speaking');
+    
+    // Validate audio context is ready
+    if (!audioContext) {
+        console.error('⚠ WARNING: audioContext not initialized!');
+    } else if (audioContext.state !== 'running') {
+        console.warn('⚠ AudioContext state:', audioContext.state);
+        audioContext.resume().then(() => {
+            console.log('✓ AudioContext resumed');
+        });
+    }
 }
 
 function endUserSpeech(reason = 'silence') {
     if (!inSpeech) return;
 
+    const duration = (speechDuration / 1000).toFixed(1);
+    console.log(`📤 Ending speech (${reason}): duration=${duration}s`);
+
     inSpeech = false;
     speechFrames = 0;
     silenceFrames = 0;
     silenceDurationMs = 0;
+    speechDuration = 0;
     vadIndicator.classList.remove('listening');
     statusDiv.textContent = 'Processing...';
     statusDiv.className = 'status-text';
-    appendControlMessage(reason === 'max_duration' ? 'Speech max duration reached' : 'Speech ended');
+    
+    const msg = reason === 'max_duration' 
+        ? `Speech ended (max ${MAX_SPEECH_DURATION_MS/1000}s reached)` 
+        : `Speech ended (${duration}s)`;
+    appendControlMessage(msg);
 
     if (websocket && websocket.readyState === WebSocket.OPEN) {
-        websocket.send(JSON.stringify({ type: "TURN_END", reason }));
+        websocket.send(JSON.stringify({ type: "TURN_END", reason, duration: parseFloat(duration) }));
+        console.log('✓ Sent TURN_END to server');
     }
     lockMicInput();
     awaitingAudioReady = true;
@@ -294,6 +370,141 @@ function applyPreEmphasis(input, coeff = PRE_EMPHASIS_COEFF) {
 
     lastPreEmphasisSample = previous;
     return filtered;
+}
+
+// ================= PROFESSIONAL VAD FEATURE EXTRACTION =================
+
+function computeZeroCrossingRate(samples) {
+    let crossings = 0;
+    for (let i = 1; i < samples.length; i++) {
+        if ((samples[i] >= 0 && samples[i - 1] < 0) || 
+            (samples[i] < 0 && samples[i - 1] >= 0)) {
+            crossings++;
+        }
+    }
+    return crossings / samples.length;
+}
+
+function computeSpectralCentroid(samples, sampleRate) {
+    // Simple spectral centroid using time-domain approximation
+    // Full FFT would be better but too expensive for real-time
+    let weightedSum = 0;
+    let totalEnergy = 0;
+    
+    for (let i = 0; i < samples.length; i++) {
+        const energy = samples[i] * samples[i];
+        const freq = (i / samples.length) * (sampleRate / 2);
+        weightedSum += freq * energy;
+        totalEnergy += energy;
+    }
+    
+    return totalEnergy > 0 ? weightedSum / totalEnergy : 0;
+}
+
+function computeAudioFeatures(samples, sampleRate) {
+    // Energy features
+    let sumSquares = 0;
+    let peak = 0;
+    
+    for (let i = 0; i < samples.length; i++) {
+        const v = samples[i];
+        sumSquares += v * v;
+        peak = Math.max(peak, Math.abs(v));
+    }
+    
+    const rms = Math.sqrt(sumSquares / samples.length);
+    const zcr = computeZeroCrossingRate(samples);
+    const spectralCentroid = computeSpectralCentroid(samples, sampleRate);
+    
+    return { rms, peak, zcr, spectralCentroid };
+}
+
+function calibrateNoiseFloor(features) {
+    noiseSamples.push(features.rms);
+    
+    if (calibrationFrameCount >= CALIBRATION_FRAMES) {
+        // Calculate noise floor as mean + 2*std of calibration samples
+        const mean = noiseSamples.reduce((a, b) => a + b, 0) / noiseSamples.length;
+        const variance = noiseSamples.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / noiseSamples.length;
+        const std = Math.sqrt(variance);
+        
+        noiseFloorRMS = mean;
+        noiseFloorPeak = mean + std;
+        
+        // Set adaptive thresholds with safety margins
+        energyThreshold = Math.max(0.005, noiseFloorRMS * 3);
+        peakThreshold = Math.max(0.01, noiseFloorPeak * 2.5);
+        
+        isCalibrated = true;
+        console.log('✅ VAD calibrated:', {
+            noiseFloor: noiseFloorRMS.toFixed(4),
+            energyThreshold: energyThreshold.toFixed(4),
+            peakThreshold: peakThreshold.toFixed(4)
+        });
+        appendControlMessage(`Mic calibrated. Noise: ${noiseFloorRMS.toFixed(4)}`);
+    }
+    
+    calibrationFrameCount++;
+}
+
+function updateAdaptiveThresholds(features) {
+    // Keep running history
+    recentEnergyLevels.push(features.rms);
+    recentPeakLevels.push(features.peak);
+    
+    if (recentEnergyLevels.length > HISTORY_SIZE) {
+        recentEnergyLevels.shift();
+        recentPeakLevels.shift();
+    }
+    
+    // Adapt thresholds using exponential moving average
+    if (recentEnergyLevels.length >= 10) {
+        const avgEnergy = recentEnergyLevels.reduce((a, b) => a + b, 0) / recentEnergyLevels.length;
+        const avgPeak = recentPeakLevels.reduce((a, b) => a + b, 0) / recentPeakLevels.length;
+        
+        // Update noise floor slowly (only during non-speech)
+        if (!inSpeech && silenceFrames > 10) {
+            noiseFloorRMS = ADAPTATION_ALPHA * noiseFloorRMS + (1 - ADAPTATION_ALPHA) * avgEnergy;
+            energyThreshold = Math.max(0.005, noiseFloorRMS * 3);
+            peakThreshold = Math.max(0.01, avgPeak * 1.5);
+        }
+    }
+}
+
+function detectSpeech(features) {
+    // Multi-feature decision with weighted voting
+    let votes = 0;
+    let confidence = 0;
+    
+    // Feature 1: Energy (RMS) - most important
+    if (features.rms > energyThreshold) {
+        votes += 2;
+        confidence += (features.rms / energyThreshold) * 0.4;
+    }
+    
+    // Feature 2: Peak amplitude - catches sharp sounds
+    if (features.peak > peakThreshold) {
+        votes += 2;
+        confidence += (features.peak / peakThreshold) * 0.3;
+    }
+    
+    // Feature 3: Zero-crossing rate - distinguishes speech from noise
+    // Speech typically has moderate ZCR (0.1-0.5)
+    if (features.zcr > 0.05 && features.zcr < 0.6) {
+        votes += 1;
+        confidence += 0.15;
+    }
+    
+    // Feature 4: Spectral centroid - speech has higher frequencies
+    if (features.spectralCentroid > spectralThreshold) {
+        votes += 1;
+        confidence += 0.15;
+    }
+    
+    // Need at least 3 votes to consider it speech (out of 6 possible)
+    const isSpeech = votes >= 3;
+    
+    return { isSpeech, confidence: Math.min(confidence, 1.0), votes };
 }
 
 // ================= CONTROL MESSAGE HANDLING ================= //
@@ -317,6 +528,15 @@ function handleControlMessage(rawMessage) {
     const message = (rawMessage ?? '').toString().trim();
     if (!message) return;
 
+    // Debounce duplicate messages within 500ms
+    const now = Date.now();
+    if (message === lastControlMessage && (now - lastControlMessageTime) < 500) {
+        console.log('Ignoring duplicate control message:', message);
+        return;
+    }
+    lastControlMessage = message;
+    lastControlMessageTime = now;
+
     console.log('Control message:', message);
     appendControlMessage(message);
 
@@ -325,14 +545,20 @@ function handleControlMessage(rawMessage) {
     if (normalized === CONTROL_READY_MESSAGE.toLowerCase()) {
         statusDiv.textContent = 'Ready...';
         statusDiv.className = 'status-text';
-        serverReadyPending = true;
-        if (readyTimer) {
-            clearTimeout(readyTimer);
+        
+        // Only process if we're not already in an active state
+        if (!inSpeech && activePlaybackSources === 0) {
+            serverReadyPending = true;
+            if (readyTimer) {
+                clearTimeout(readyTimer);
+            }
+            readyTimer = setTimeout(() => {
+                readyTimer = null;
+                maybeEnableMicListening();
+            }, STANDARD_DELAY_MS);
+        } else {
+            console.log('Ignoring ready message: inSpeech=', inSpeech, 'activePlayback=', activePlaybackSources);
         }
-        readyTimer = setTimeout(() => {
-            readyTimer = null;
-            maybeEnableMicListening();
-        }, STANDARD_DELAY_MS);
         return;
     }
 
@@ -377,45 +603,92 @@ async function startMicrophone() {
         scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
         frameDurationMs = (scriptProcessor.bufferSize / audioContext.sampleRate) * 1000;
 
+        let audioProcessingLogCount = 0;
+        let lastAudioLogTime = 0;
+        
         scriptProcessor.onaudioprocess = (event) => {
             const input = event.inputBuffer.getChannelData(0);
+            const now = Date.now();
+
+            // Log status periodically
+            audioProcessingLogCount++;
+            if (audioProcessingLogCount % 100 === 1 && now - lastAudioLogTime > 2000) {
+                console.log('🎙️ Audio callback active. State:', {
+                    micLocked,
+                    isListeningEnabled,
+                    inSpeech,
+                    calibrated: isCalibrated,
+                    energyThreshold: energyThreshold.toFixed(4),
+                    peakThreshold: peakThreshold.toFixed(4)
+                });
+                lastAudioLogTime = now;
+            }
 
             if (micLocked || !isListeningEnabled) {
+                if (inSpeech || speechFrames > 0) {
+                    console.log('⚠ Audio processing disabled: micLocked=', micLocked, 'isListeningEnabled=', isListeningEnabled);
+                }
                 resetVadState();
                 return;
             }
 
+            // Apply pre-emphasis filter
             const emphasized = applyPreEmphasis(input);
 
-            // ---------- ENERGY CALCULATION ----------
-            let sumSquares = 0;
-            let peak = 0;
+            // ---------- EXTRACT AUDIO FEATURES ----------
+            const features = computeAudioFeatures(emphasized, audioContext.sampleRate);
 
-            for (let i = 0; i < emphasized.length; i++) {
-                const v = emphasized[i];
-                sumSquares += v * v;
-                peak = Math.max(peak, Math.abs(v));
+            // ---------- CALIBRATION PHASE ----------
+            if (!isCalibrated) {
+                calibrateNoiseFloor(features);
+                if (calibrationFrameCount < CALIBRATION_FRAMES) {
+                    statusDiv.textContent = `Calibrating mic... ${Math.round((calibrationFrameCount / CALIBRATION_FRAMES) * 100)}%`;
+                    return; // Don't process speech during calibration
+                }
             }
 
-            const rms = Math.sqrt(sumSquares / emphasized.length);
-            const isSpeech = rms > ENERGY_THRESHOLD || peak > PEAK_THRESHOLD;
+            // ---------- ADAPTIVE THRESHOLD UPDATE ----------
+            updateAdaptiveThresholds(features);
+
+            // ---------- SPEECH DETECTION ----------
+            const detection = detectSpeech(features);
+            
+            // Log detection details occasionally
+            if (audioProcessingLogCount % 50 === 0 && now - lastAudioLogTime > 1000) {
+                console.log('🔊 Features:', {
+                    RMS: features.rms.toFixed(4),
+                    Peak: features.peak.toFixed(4),
+                    ZCR: features.zcr.toFixed(3),
+                    isSpeech: detection.isSpeech,
+                    confidence: detection.confidence.toFixed(2),
+                    votes: detection.votes,
+                    speechFrames
+                });
+            }
 
             // ---------- VAD STATE MACHINE ----------
-            if (isSpeech) {
+            if (detection.isSpeech) {
                 speechFrames++;
                 silenceFrames = 0;
                 silenceDurationMs = 0;
             } else {
                 silenceFrames++;
-                speechFrames = 0;
-                silenceDurationMs += frameDurationMs;
+                if (inSpeech) {
+                    // Only reset speech frames if we've been silent for a while
+                    silenceDurationMs += frameDurationMs;
+                } else {
+                    speechFrames = 0;
+                }
             }
 
             // ---------- SPEECH START ----------
             if (!inSpeech && speechFrames >= SPEECH_START_FRAMES) {
+                console.log('🎤 SPEECH STARTED - speechFrames:', speechFrames, 'confidence:', detection.confidence.toFixed(2));
                 inSpeech = true;
                 speechFrames = 0;
+                silenceFrames = 0;
                 speechStartTimestamp = performance.now();
+                speechDuration = 0;
                 awaitingAudioReady = false;
                 awaitingPlaybackCompletion = false;
                 serverReadyPending = false;
@@ -424,22 +697,43 @@ async function startMicrophone() {
                 vadIndicator.classList.remove('speaking');
                 statusDiv.textContent = 'You are speaking...';
                 statusDiv.className = 'status-text active';
-                appendControlMessage('Speech detected');
+                appendControlMessage('🎤 Speech detected');
 
-                websocket?.send(JSON.stringify({ type: "TURN_START" }));
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    websocket.send(JSON.stringify({ type: "TURN_START" }));
+                    console.log('✓ Sent TURN_START to server');
+                } else {
+                    console.error('⚠ Cannot send TURN_START - WebSocket not open');
+                }
             }
 
-            // ---------- MAX DURATION SAFEGUARD ----------
+            // ---------- TRACK SPEECH DURATION ----------
             if (inSpeech) {
                 const elapsed = performance.now() - speechStartTimestamp;
+                speechDuration = elapsed;
+                
+                // Max duration safeguard
                 if (elapsed >= MAX_SPEECH_DURATION_MS) {
+                    console.log('⏱️ Max speech duration reached:', (elapsed/1000).toFixed(1), 'seconds');
                     endUserSpeech('max_duration');
                     return;
                 }
             }
 
-            // ---------- SPEECH END ----------
-            if (inSpeech && silenceDurationMs >= SILENCE_GRACE_MS) {
+            // ---------- SPEECH END (with proper hangover) ----------
+            if (inSpeech && silenceFrames >= SPEECH_END_FRAMES) {
+                // Check minimum speech duration to avoid false triggers
+                if (speechDuration < MIN_SPEECH_DURATION_MS) {
+                    console.log('⚠ Speech too short, ignoring:', speechDuration.toFixed(0), 'ms');
+                    inSpeech = false;
+                    speechFrames = 0;
+                    silenceFrames = 0;
+                    vadIndicator.classList.remove('listening');
+                    return;
+                }
+                
+                console.log('🛑 Speech ended after', (speechDuration/1000).toFixed(1), 'seconds of speech,', 
+                           (silenceFrames * frameDurationMs).toFixed(0), 'ms silence');
                 endUserSpeech('silence');
                 return;
             }
@@ -462,10 +756,10 @@ async function startMicrophone() {
 
         source.connect(scriptProcessor);
         scriptProcessor.connect(audioContext.destination);
-        statusDiv.textContent = 'Microphone ready...';
-        statusDiv.className = 'status-text';
+        console.log('✓ Microphone initialized and connected');
+        // Don't set status here - let the state machine handle it
     } catch (err) {
-        console.error(err);
+        console.error('Microphone initialization error:', err);
         statusDiv.textContent = 'Microphone Error';
         statusDiv.className = 'status-text';
         stopStreaming();
@@ -505,14 +799,22 @@ function playAudioFrameStreaming(frameData) {
         activePlaybackSources++;
         source.onended = () => {
             activePlaybackSources = Math.max(0, activePlaybackSources - 1);
+            console.log('Audio source ended. Active sources:', activePlaybackSources);
+            
             if (activePlaybackSources === 0) {
-                awaitingPlaybackCompletion = false;
-                vadIndicator.classList.remove('speaking');
-                if (readyTimer) {
-                    clearTimeout(readyTimer);
-                    readyTimer = null;
-                }
-                maybeEnableMicListening({ force: true });
+                // Wait a bit before re-enabling mic to avoid cutting off tail of audio
+                setTimeout(() => {
+                    if (activePlaybackSources === 0 && !inSpeech) {
+                        console.log('All playback complete, re-enabling mic');
+                        awaitingPlaybackCompletion = false;
+                        vadIndicator.classList.remove('speaking');
+                        if (readyTimer) {
+                            clearTimeout(readyTimer);
+                            readyTimer = null;
+                        }
+                        maybeEnableMicListening({ force: true });
+                    }
+                }, 100);
             }
         };
         
