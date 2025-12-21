@@ -150,7 +150,9 @@ function startStreaming() {
     // Build WebSocket URL with toy_id query parameter
     const toyId = toyIdInput.value.trim();
     let wsUrl = getServerURL();
+
     // wsUrl = 'ws://127.0.0.1:8000'
+    
     if (toyId) {
         const separator = wsUrl.includes('?') ? '&' : '?';
         wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
