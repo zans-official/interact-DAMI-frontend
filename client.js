@@ -16,9 +16,17 @@ if (debugToggle) {
     });
 }
 
-const SERVER_URL = 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
+// // Dynamic SERVER_URL based on language selection
+function getServerURL() {
+    const englishMode = document.getElementById('englishMode');
+    const multilingualMode = document.getElementById('multilingualMode');
+    
+    if (multilingualMode && multilingualMode.checked) {
+        return 'wss://esp-backend-multilingual-612228147959.asia-south1.run.app';
+    }
+    return 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
+}
 // const SERVER_URL = 'ws://127.0.0.1:8000/';  // Use ws:// for local development
-// const SERVER_URL = 'wss://esp-backend-multilingual-612228147959.asia-south1.run.app';
 
 // Frame size limits for WebSocket
 const OUTGOING_MAX_FRAME_SIZE = 1024;
@@ -141,12 +149,14 @@ function startStreaming() {
 
     // Build WebSocket URL with toy_id query parameter
     const toyId = toyIdInput.value.trim();
-    let wsUrl = SERVER_URL;
+    let wsUrl = getServerURL();
     if (toyId) {
         const separator = wsUrl.includes('?') ? '&' : '?';
         wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
         appendControlMessage(`Using toy_id: ${toyId}`);
     }
+    const languageMode = document.getElementById('multilingualMode').checked ? 'Multilingual' : 'English Only';
+    appendControlMessage(`Language Mode: ${languageMode}`);
 
     websocket = new WebSocket(wsUrl);
     websocket.binaryType = 'arraybuffer';
