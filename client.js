@@ -100,6 +100,7 @@ let micRecordingChunks = [];
 let isMicRecording = true;
 let lastControlMessage = null;
 let lastControlMessageTime = 0;
+let lastReadyMessageProcessed = false; // Track if READY_TO_LISTEN has been processed
 
 toggleButton.addEventListener('click', () => {
     if (toggleButton.classList.contains('inactive')) {
@@ -134,6 +135,7 @@ function startStreaming() {
     awaitingPlaybackCompletion = false;
     serverReadyPending = false;
     activePlaybackSources = 0;
+    lastReadyMessageProcessed = false;
     micRecordingChunks = [];
     if (downloadMicButton) downloadMicButton.disabled = true;
     resetVadState();
@@ -150,6 +152,7 @@ function startStreaming() {
     // Build WebSocket URL with toy_id query parameter
     const toyId = toyIdInput.value.trim();
     let wsUrl = getServerURL();
+    wsUrl = 'ws://127.0.0.1:8000'
     if (toyId) {
         const separator = wsUrl.includes('?') ? '&' : '?';
         wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
@@ -227,6 +230,7 @@ function stopStreamingCleanup() {
     // Reset state flags
     isListeningEnabled = false;
     nextPlaybackTime = 0;
+    lastReadyMessageProcessed = false;
     if (readyTimer) {
         clearTimeout(readyTimer);
         readyTimer = null;
@@ -321,6 +325,7 @@ function maybeEnableMicListening(options = {}) {
     console.log('✓ Enabling microphone listening');
     micLocked = false;
     isListeningEnabled = true;
+    lastReadyMessageProcessed = true;
     serverReadyPending = false;
     awaitingAudioReady = false;
     awaitingPlaybackCompletion = false;
@@ -350,6 +355,7 @@ function endUserSpeech(reason = 'silence') {
     silenceFrames = 0;
     silenceDurationMs = 0;
     speechDuration = 0;
+    lastReadyMessageProcessed = false;
     vadIndicator.classList.remove('listening');
     statusDiv.textContent = 'Processing...';
     statusDiv.className = 'status-text';
@@ -554,8 +560,15 @@ function handleControlMessage(rawMessage) {
     const normalized = message.toLowerCase();
 
     if (normalized === CONTROL_READY_MESSAGE.toLowerCase()) {
+        // Ignore multiple READY_TO_LISTEN messages until we actually start listening or speech ends
+        if (lastReadyMessageProcessed && isListeningEnabled) {
+            console.log('Ignoring duplicate READY_TO_LISTEN - already listening');
+            return;
+        }
+
         statusDiv.textContent = 'Ready...';
         statusDiv.className = 'status-text';
+        lastReadyMessageProcessed = true;
         
         // Only process if we're not already in an active state
         if (!inSpeech && activePlaybackSources === 0) {
@@ -574,6 +587,7 @@ function handleControlMessage(rawMessage) {
     }
 
     if (normalized === CONTROL_AUDIO_READY_MESSAGE.toLowerCase()) {
+        lastReadyMessageProcessed = false;
         if (readyTimer) {
             clearTimeout(readyTimer);
             readyTimer = null;
@@ -600,6 +614,7 @@ function handleControlMessage(rawMessage) {
     }
 
     if (normalized === CONTROL_FAILED_MESSAGE.toLowerCase()) {
+        lastReadyMessageProcessed = false;
         if (readyTimer) {
             clearTimeout(readyTimer);
             readyTimer = null;
