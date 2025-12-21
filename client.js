@@ -24,8 +24,9 @@ const SERVER_URL = 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
 const OUTGOING_MAX_FRAME_SIZE = 1024;
 const INCOMING_MAX_FRAME_SIZE = 2048;
 const STANDARD_DELAY_MS = 100;
-const CONTROL_READY_MESSAGE = 'Ready to listen';
-const CONTROL_AUDIO_READY_MESSAGE = 'Audio Ready';
+const CONTROL_READY_MESSAGE = 'READY_TO_LISTEN';
+const CONTROL_AUDIO_READY_MESSAGE = 'AUDIO_READY';
+const CONTROL_FAILED_MESSAGE = 'FAILED';
 const MAX_SPEECH_DURATION_MS = 8000;
 const PRE_EMPHASIS_COEFF = 0.90;
 const SILENCE_GRACE_MS = 1500;  // Reduced from 2500ms for faster response
@@ -585,6 +586,24 @@ function handleControlMessage(rawMessage) {
                 maybeEnableMicListening({ force: true });
             }
         }, 3000);
+        return;
+    }
+
+    if (normalized === CONTROL_FAILED_MESSAGE.toLowerCase()) {
+        if (readyTimer) {
+            clearTimeout(readyTimer);
+            readyTimer = null;
+        }
+        lockMicInput();
+        awaitingAudioReady = false;
+        awaitingPlaybackCompletion = false;
+        serverReadyPending = false;
+        resetVadState();
+        statusDiv.textContent = 'Control failed, waiting to reconnect...';
+        statusDiv.className = 'status-text';
+        vadIndicator.classList.remove('speaking', 'listening');
+        appendControlMessage('Control failed. Waiting for ready signal...');
+        console.log('⚠️ Control failed - resetting to mic state, awaiting READY_TO_LISTEN');
         return;
     }
 
