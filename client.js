@@ -20,10 +20,7 @@ if (debugToggle) {
 function getServerURL() {
     const englishMode = document.getElementById('englishMode');
     const multilingualMode = document.getElementById('multilingualMode');
-    
-    if (multilingualMode && multilingualMode.checked) {
-        return 'wss://esp-backend-multilingual-612228147959.asia-south1.run.app';
-    }
+
     return 'wss://esp-backend-eng-612228147959.asia-south1.run.app';
 }
 // const SERVER_URL = 'ws://127.0.0.1:8000/';  // Use ws:// for local development
@@ -154,8 +151,6 @@ function startStreaming() {
     // Using query parameter as standard practice for WebSocket metadata
     const toyId = 'promo';  // Hardcoded to 'promo' for promotional mode
     let wsUrl = getServerURL();
-
-    wsUrl = 'ws://127.0.0.1:8000'
     
     const separator = wsUrl.includes('?') ? '&' : '?';
     wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
