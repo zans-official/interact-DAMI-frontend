@@ -30,7 +30,7 @@ function getServerURL() {
 
 // Frame size limits for WebSocket
 const OUTGOING_MAX_FRAME_SIZE = 1024;
-const INCOMING_MAX_FRAME_SIZE = 2048;
+const INCOMING_MAX_FRAME_SIZE = 4096;
 const STANDARD_DELAY_MS = 100;
 const CONTROL_READY_MESSAGE = 'READY_TO_LISTEN';
 const CONTROL_AUDIO_READY_MESSAGE = 'AUDIO_READY';
@@ -79,6 +79,7 @@ let serverReadyPending = false;
 let activePlaybackSources = 0;
 let lastPreEmphasisSample = 0;
 let silenceDurationMs = 0;
+let isClosingConnection = false;
 
 
 let websocket;
@@ -134,6 +135,7 @@ function startStreaming() {
     awaitingPlaybackCompletion = false;
     serverReadyPending = false;
     activePlaybackSources = 0;
+    isClosingConnection = false;
     micRecordingChunks = [];
     if (downloadMicButton) downloadMicButton.disabled = true;
     resetVadState();
@@ -148,16 +150,17 @@ function startStreaming() {
     }
 
     // Build WebSocket URL with toy_id query parameter
-    const toyId = toyIdInput.value.trim();
+    // Note: Browser WebSocket API doesn't support custom headers directly
+    // Using query parameter as standard practice for WebSocket metadata
+    const toyId = 'promo';  // Hardcoded to 'promo' for promotional mode
     let wsUrl = getServerURL();
 
-    // wsUrl = 'ws://127.0.0.1:8000'
+    wsUrl = 'ws://127.0.0.1:8000'
     
-    if (toyId) {
-        const separator = wsUrl.includes('?') ? '&' : '?';
-        wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
-        appendControlMessage(`Using toy_id: ${toyId}`);
-    }
+    const separator = wsUrl.includes('?') ? '&' : '?';
+    wsUrl = `${wsUrl}${separator}toy_id=${encodeURIComponent(toyId)}`;
+    appendControlMessage(`Using toy_id: ${toyId}`);
+    
     const languageMode = document.getElementById('multilingualMode').checked ? 'Multilingual' : 'English Only';
     appendControlMessage(`Language Mode: ${languageMode}`);
 
@@ -192,10 +195,21 @@ function startStreaming() {
 
     websocket.onclose = () => {
         console.log('WebSocket closed.');
-        statusDiv.textContent = 'Speak to DAMI';
-        statusDiv.className = 'status-text';
-        appendControlMessage('Connection closed.');
-        stopStreamingCleanup();
+        isClosingConnection = true;
+        
+        // If audio is still playing, let it finish before cleanup
+        if (activePlaybackSources > 0) {
+            console.log(`⏳ Waiting for ${activePlaybackSources} audio sources to finish before cleanup`);
+            statusDiv.textContent = 'Playing final audio...';
+            statusDiv.className = 'status-text';
+            appendControlMessage('Connection closed. Playing remaining audio...');
+            // Cleanup will be triggered when last audio source ends
+        } else {
+            statusDiv.textContent = 'Speak to DAMI';
+            statusDiv.className = 'status-text';
+            appendControlMessage('Connection closed.');
+            stopStreamingCleanup();
+        }
     };
 
     websocket.onerror = (err) => {
@@ -256,6 +270,7 @@ function stopStreamingCleanup() {
     awaitingPlaybackCompletion = false;
     serverReadyPending = false;
     activePlaybackSources = 0;
+    isClosingConnection = false;
 }
 
 function resetVadState() {
@@ -772,7 +787,7 @@ async function startMicrophone() {
 
             // ---------- SEND AUDIO ONLY IF SPEAKING ----------
             if (inSpeech && websocket.readyState === WebSocket.OPEN) {
-                const resampled = resampleTo16k(emphasized, audioContext.sampleRate);
+                const resampled = resampleTo24k(emphasized, audioContext.sampleRate);
                 const pcm16 = toPCM16(resampled);
                 
                 // Record user mic input for debugging
@@ -806,7 +821,7 @@ function playAudioFrameStreaming(frameData) {
 
         // Initialize playback context if needed
         if (!playbackContext) {
-            playbackContext = new AudioContext({ sampleRate: 16000 });
+            playbackContext = new AudioContext({ sampleRate: 24000 });
             nextPlaybackTime = playbackContext.currentTime;
         }
 
@@ -820,7 +835,7 @@ function playAudioFrameStreaming(frameData) {
         }
 
         // Create audio buffer for this frame
-        const buffer = playbackContext.createBuffer(1, sampleCount, 16000);
+        const buffer = playbackContext.createBuffer(1, sampleCount, 24000);
         buffer.getChannelData(0).set(floatSamples);
 
         // Create source and schedule it to play at precise time
@@ -834,9 +849,19 @@ function playAudioFrameStreaming(frameData) {
             console.log('Audio source ended. Active sources:', activePlaybackSources);
             
             if (activePlaybackSources === 0) {
+                // If connection is closing, perform cleanup now
+                if (isClosingConnection) {
+                    console.log('✓ All audio playback complete after connection close. Cleaning up.');
+                    statusDiv.textContent = 'Speak to DAMI';
+                    statusDiv.className = 'status-text';
+                    appendControlMessage('Audio playback completed.');
+                    stopStreamingCleanup();
+                    return;
+                }
+                
                 // Wait a bit before re-enabling mic to avoid cutting off tail of audio
                 setTimeout(() => {
-                    if (activePlaybackSources === 0 && !inSpeech) {
+                    if (activePlaybackSources === 0 && !inSpeech && !isClosingConnection) {
                         console.log('All playback complete, re-enabling mic');
                         awaitingPlaybackCompletion = false;
                         vadIndicator.classList.remove('speaking');
@@ -857,7 +882,7 @@ function playAudioFrameStreaming(frameData) {
         source.start(startTime);
         
         // Calculate when this frame will finish playing
-        const frameDuration = sampleCount / 16000; // duration in seconds
+        const frameDuration = sampleCount / 24000; // duration in seconds
         nextPlaybackTime = startTime + frameDuration;
         
     } catch (e) {
@@ -873,7 +898,7 @@ function downloadRecording() {
         return;
     }
 
-    const wav = encodeWAV(recordingChunks, 16000);
+    const wav = encodeWAV(recordingChunks, 24000);
     const blob = new Blob([wav], { type: 'audio/wav' });
 
     const link = document.createElement('a');
@@ -892,7 +917,7 @@ function downloadMicRecording() {
         return;
     }
 
-    const wav = encodeWAV(micRecordingChunks, 16000);
+    const wav = encodeWAV(micRecordingChunks, 24000);
     const blob = new Blob([wav], { type: 'audio/wav' });
 
     const link = document.createElement('a');
@@ -923,9 +948,9 @@ function sendAudioInChunks(audioBuffer) {
     }
 }
 
-function resampleTo16k(input, origRate) {
-    if (origRate === 16000) return input;
-    const ratio = origRate / 16000;
+function resampleTo24k(input, origRate) {
+    if (origRate === 24000) return input;
+    const ratio = origRate / 24000;
     const newLen = Math.round(input.length / ratio);
     const result = new Float32Array(newLen);
 
